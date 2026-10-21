@@ -6,6 +6,7 @@ import argparse
 import json
 from abc import ABC, abstractmethod
 
+from ..config.constants import MODELS
 from ..core.utils import Task
 from ..paths import PATHS
 
@@ -24,7 +25,9 @@ class Command(ABC):
         parser.add_argument("--agents", nargs="+", required=True,
                             help="Agent frameworks to run, e.g. openhands codex")
         parser.add_argument("--model-names", nargs="+", required=True,
-                            help="Models to run under each agent")
+                            choices=MODELS, metavar="M",
+                            help="Models to run under each agent, by their name "
+                                 "in MODELS (patchbench/config/constants.py)")
         parser.add_argument("--tag", default="",
                             help="Label separating otherwise identical runs; "
                                  "appended to generated names only when set")

@@ -1,0 +1,44 @@
+#!/opt/agent/bin/python -I
+"""Stands in for every shell in the agent image (bash, sh, dash, rbash).
+
+The agent program starts this whenever it runs a command. It runs as the
+agent's unprivileged user and hands the command to ``forward``, through the one
+sudo rule that user has, together with the settings the agent attached to it:
+the terminal settings, every variable the agent added on top of the
+environment the harness started it with (whose record leaves out the API keys,
+so those are passed too), and the folders it added to ``PATH``.
+"""
+
+import os
+import sys
+
+FORWARD = "/opt/patchbench/libexec/forward"
+#: Written by the harness: the variables the agent program was started with,
+#: and its ``PATH``.
+BASE_ENV_FILE = "/opt/patchbench/agent-base-env"
+BASE_PATH_FILE = "/opt/patchbench/agent-base-path"
+#: Passed even when the harness set them too, as the agent sets them for its
+#: terminal. The locale is not among them: what the harness or its Python set
+#: there stays behind, like the rest of the environment it started the agent with.
+TERMINAL = {"TERM", "COLUMNS", "LINES"}
+
+try:
+    base = set(open(BASE_ENV_FILE).read().split())
+except OSError:
+    base = set()
+env = [f"--env={name}={value}" for name, value in os.environ.items()
+       if name in TERMINAL or name not in base]
+# Such as the folder Codex keeps its `apply_patch` helper in. forward puts the
+# ones the task container also has in front of that container's PATH.
+try:
+    base_path = open(BASE_PATH_FILE).read().split(":")
+except OSError:
+    base_path = []
+added = [d for d in os.environ.get("PATH", "").split(":") if d and d not in base_path]
+if added:
+    env.append(f"--env=PB_AGENT_PATH={':'.join(added)}")
+try:
+    cwd = os.getcwd()
+except OSError:
+    cwd = "/"
+os.execv("/usr/bin/sudo", ["sudo", "-n", FORWARD, cwd, *env, "--", *sys.argv[1:]])

@@ -1,368 +1,195 @@
-"""Claude Code harness.
+"""Runs Claude Code through the Claude Agent SDK."""
 
-Unlike the other agents, Claude Code cannot be installed inside the task image,
-so this harness runs on the host: it copies the repository out of the image,
-mounts that copy back into a live container, and lets the agent edit on the host
-while verifying through ``docker exec``. The output contract is identical to the
-container-side harnesses -- a diff at ``{out_base}.diff`` and budget snapshots at
-``{out_base}_{threshold}.diff``.
-"""
-
-import argparse
 import asyncio
 import json
 import os
-import re
 import shutil
-import subprocess
-import time
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
-from git import Repo
+from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookMatcher,
+                              ResultMessage, SystemMessage, ToolResultBlock, ToolUseBlock,
+                              UserMessage)
 
-from constants import *
-
-
-# Total dollar budget allowed for a single run.
-BUDGET_LIMIT = 30
-# A diff snapshot is taken every time the cost crosses a multiple of this value.
-COST_STEP = 5
-
-C_CPP_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+from agent_base import AGENT_HOME, AGENT_USER, BUDGET_LIMIT, AgentHarness, main
 
 #: Tool names whose arguments name a file the agent edited.
 WRITE_TOOL_NAMES = {"Write", "Edit", "MultiEdit", "NotebookEdit",
                     "create", "str_replace", "insert", "undo_edit"}
+#: Argument names that hold a file path.
 PATH_FIELD_NAMES = {"path", "file_path", "filePath", "target_file",
                     "new_file_path", "old_file_path"}
+#: Built-in tools that read or write files directly rather than through the shell.
+FILE_TOOLS = "Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep"
 
 
-def run_cmd(cmd, check=True, capture=False):
-    """Run a docker command on the host."""
-    return subprocess.run(cmd, check=check, text=True,
-                          stdout=subprocess.PIPE if capture else None)
+class ClaudeCodeHarness(AgentHarness):
+    name = "claudecode"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.api_key = os.getenv("ANTHROPIC_API_KEY")
+        assert self.api_key is not None, "ANTHROPIC_API_KEY environment variable is not set."
+        self.chat_history = self.log_dir / "claudecode-chat-log.jsonl"
+        # A previous run's transcript would be read as this run's until the
+        # session ends and replaces it.
+        self.chat_history.unlink(missing_ok=True)
+        # Repo files written so far, so a snapshot taken mid-run includes new
+        # files; the transcript only arrives once the session has ended.
+        self._written: set[str] = set()
+        # Write-tool calls still waiting for their result: call id -> repo file.
+        self._pending_writes: dict[str, str] = {}
 
-class ClaudeCodeRunner:
-    """Drives Claude Code against a host copy of the task repository."""
+    # -- running the agent --------------------------------------------------
 
-    def __init__(self, model_name, log_dir="/tmp/.claudecode"):
-        self.model_name = model_name
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+    def invoke(self, prompt: str) -> None:
+        """Run one SDK session, reporting spend as messages arrive."""
+        asyncio.run(self._invoke_async(prompt))
 
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        assert api_key is not None, "ANTHROPIC_API_KEY environment variable is not set."
-        self.api_env = {"ANTHROPIC_API_KEY": api_key,
-                        "CLAUDE_CODE_EFFORT_LEVEL": "high"}
+    async def _invoke_async(self, prompt: str) -> None:
+        options = ClaudeAgentOptions(
+            model=self.model_name,
+            permission_mode="default",
+            cwd=self.repo_folder,
+            # The SDK runs here as root and starts the CLI as the agent's user.
+            user=AGENT_USER,
+            env=self.agent_env(ANTHROPIC_API_KEY=self.api_key,
+                               CLAUDE_CODE_EFFORT_LEVEL="high"),
+            allowed_tools=["Read", "Write", "Edit", "Bash"],
+            disallowed_tools={"WebSearch", "WebFetch"},
+            hooks={"PreToolUse": [HookMatcher(matcher=FILE_TOOLS, hooks=[self._file_gate])]},
+            max_budget_usd=BUDGET_LIMIT,
+        )
 
-    # -- container lifecycle -------------------------------------------------
+        session_id = None
+        counted: dict[str, float] = {}
+        # The commands Claude Code has moved to the background, as it last
+        # listed them. When one ends it starts a turn of its own to report it,
+        # so the session ends at the first result with none left running.
+        background: list = []
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for message in client.receive_messages():
+                print(message, flush=True)
+                self._note_writes(message)
+                if isinstance(message, SystemMessage) and message.subtype == "background_tasks_changed":
+                    background = message.data.get("tasks") or []
+                    continue
+                if isinstance(message, ResultMessage):
+                    session_id = message.session_id
+                    if message.total_cost_usd is not None:
+                        self.note_spend(message.total_cost_usd)
+                    print(message.result, flush=True)
+                    if not background or message.is_error or message.subtype != "success":
+                        break
+                    continue
+                # Per-message costs arrive before the result; sum the distinct
+                # ones so snapshots happen while the run is still going.
+                mid = getattr(message, "message_id", None)
+                cost = getattr(message, "total_cost_usd", None)
+                if mid and cost is not None and counted.get(mid) != cost:
+                    counted[mid] = cost
+                    self.note_spend(sum(counted.values()))
 
-    @staticmethod
-    def locate_repo(container, project):
-        """The project checkout's path inside the image."""
-        out = run_cmd(["docker", "exec", container, "bash", "-lc",
-                       f"find /src -maxdepth 3 -type d -iname '{project}' | head -n 1"],
-                      capture=True).stdout.strip()
-        assert out, f"no directory named {project!r} under /src in the image"
-        return out
+        if session_id:
+            self._save_transcript(session_id)
 
-    @classmethod
-    def extract_repo(cls, image, container, project, workdir):
-        """Copy the repository out of the image and mount the copy back in.
+    async def _file_gate(self, input_data, _tool_use_id, _context) -> dict:
+        """Refuse a file-tool call outside the folders shared with the task container."""
+        tool_input = input_data.get("tool_input", {})
+        path = next((tool_input[key] for key in ("file_path", "path", "notebook_path")
+                     if tool_input.get(key)), None)
+        if self.file_allowed(path, input_data.get("cwd") or self.repo_folder):
+            return {}
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": f"{path}: No such file or directory",
+        }}
 
-        Returns ``(host_repo, container_repo)``. The agent edits ``host_repo``;
-        ``docker exec`` sees the same bytes at ``container_repo``.
-        """
-        # Start from a clean tree: a previous run may have been interrupted
-        # before it could remove its own.
-        discard_workdir(workdir)
-        workdir = Path(workdir)
-        workdir.mkdir(parents=True, exist_ok=True)
+    def _note_writes(self, message) -> None:
+        """Collect repo files from write-tool calls as their results arrive."""
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolUseBlock) and block.name in WRITE_TOOL_NAMES:
+                    path = self._inside_repo(block.input.get("file_path")
+                                             or block.input.get("notebook_path"))
+                    if path:
+                        self._pending_writes[block.id] = path
+        elif isinstance(message, UserMessage) and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock) and block.tool_use_id in self._pending_writes:
+                    path = self._pending_writes.pop(block.tool_use_id)
+                    if not block.is_error:
+                        self._written.add(path)
 
-        # First container: locate the checkout and copy it to the host.
-        run_cmd(["docker", "rm", "-f", container], check=False)
-        run_cmd(["docker", "run", "-dit", "--name", container, image, "bash"])
-        container_repo = cls.locate_repo(container, project)
-        run_cmd(["docker", "cp", f"{container}:{container_repo}", str(workdir)])
-        run_cmd(["docker", "rm", "-f", container], check=False)
+    def _save_transcript(self, session_id: str) -> None:
+        """Copy the session transcript into the log directory."""
+        found = sorted(Path(AGENT_HOME, ".claude", "projects").glob(f"*/{session_id}.jsonl"))
+        if found:
+            shutil.copy(found[0], self.chat_history)
+        else:
+            print(f"Claude chat history not found for session {session_id}", flush=True)
 
-        host_repo = workdir / Path(container_repo).name
-        assert host_repo.is_dir(), f"copy did not produce {host_repo}"
+    # -- changed files ------------------------------------------------------
 
-        # Second container: same image, with the host copy bound over the
-        # checkout, so the agent's edits are what `vulpatch compile` builds.
-        run_cmd(["docker", "run", "-dit", "--name", container,
-                 "-v", f"{host_repo.absolute()}:{container_repo}", image, "bash"])
-        return str(host_repo.absolute()), container_repo
+    def changed_files(self) -> list[str]:
+        """Repo files written by a write tool: seen in the messages, or named in the transcript."""
+        found: set[str] = set(self._written)
+        if not self.chat_history.exists():
+            return sorted(found)
 
-    # -- git bookkeeping -----------------------------------------------------
-
-    @staticmethod
-    def init(repo_dir):
-        """Re-initialise the repo so the diff is against a known empty baseline."""
-        git_dir = Path(repo_dir) / ".git"
-        if git_dir.exists():
-            shutil.rmtree(git_dir)
-        return Repo.init(repo_dir)
-
-    @staticmethod
-    def commit(repo):
-        msg = f"Auto-commit on {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        repo.git.commit("--allow-empty", "--no-verify", "-m", msg)
-        return repo.head.commit.hexsha
-
-    @staticmethod
-    def diff_between(repo, base_sha, head_sha):
-        return repo.git.execute(["git", "diff", base_sha, head_sha],
-                                stdout_as_string=True, strip_newline_in_stdout=False)
-
-    @staticmethod
-    def diff_worktree(repo, base_sha):
-        return repo.git.execute(["git", "diff", "--binary", base_sha, "--"],
-                                stdout_as_string=True, strip_newline_in_stdout=False)
-
-    # -- edited-file discovery ----------------------------------------------
-
-    @staticmethod
-    def changed_from_git_status(repo):
-        """C/C++ files git sees as modified, relative to the repo root."""
-        changed = []
-        for line in repo.git.status("--porcelain").splitlines():
-            if len(line) < 4:
-                continue
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            if Path(path).suffix.lower() in C_CPP_EXTENSIONS:
-                changed.append(path)
-        return sorted(set(changed))
-
-    @classmethod
-    def changed_from_chat_history(cls, chat_history, repo_folder):
-        """Repo files named by a write tool anywhere in the session log."""
-        if not Path(chat_history).exists():
-            return []
-
-        def normalize(value):
-            if not isinstance(value, str) or not value.strip():
-                return None
-            candidate = os.path.expanduser(value.strip())
-            resolved = os.path.abspath(candidate if os.path.isabs(candidate)
-                                       else os.path.join(repo_folder, candidate))
-            root = os.path.abspath(repo_folder)
-            try:
-                if os.path.commonpath([root, resolved]) != root:
-                    return None
-            except ValueError:
-                return None
-            return None if resolved.lower().endswith(".md") else resolved
-
-        def paths_in(node, found):
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if key in PATH_FIELD_NAMES:
-                        got = normalize(value)
-                        if got:
-                            found.add(got)
-                    paths_in(value, found)
-            elif isinstance(node, list):
-                for item in node:
-                    paths_in(item, found)
-
-        found = set()
-        with open(chat_history) as f:
-            for line in f:
+        with open(self.chat_history) as handle:
+            for line in handle:
                 if not line.strip():
                     continue
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                stack = [event]
-                while stack:
-                    node = stack.pop()
-                    if isinstance(node, dict):
-                        name = node.get("name") or node.get("tool_name")
-                        if isinstance(name, str) and name in WRITE_TOOL_NAMES:
-                            paths_in(node, found)
-                        stack.extend(node.values())
-                    elif isinstance(node, list):
-                        stack.extend(node)
+                self._collect_write_paths(event, found)
         return sorted(found)
 
-    @staticmethod
-    def session_log(repo_folder, session_id):
-        """Where the Claude CLI stores this session's transcript."""
-        slug = lambda v: re.sub(r"[^A-Za-z0-9]", "-", v)  # noqa: E731
-        project_dir = Path(f"~/.claude/projects/{slug(os.getcwd())}-{slug(repo_folder)}")
-        return project_dir.expanduser() / f"{session_id}.jsonl"
+    def _collect_write_paths(self, event, found: set[str]) -> None:
+        """Walk one transcript event, keeping paths named by write tools."""
+        stack = [event]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                name = node.get("name") or node.get("tool_name")
+                if isinstance(name, str) and name in WRITE_TOOL_NAMES:
+                    self._paths_in(node, found)
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
 
-    # -- the run -------------------------------------------------------------
+    def _paths_in(self, node, found: set[str]) -> None:
+        """Add every repo path held in a path field under ``node``."""
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in PATH_FIELD_NAMES:
+                    resolved = self._inside_repo(value)
+                    if resolved:
+                        found.add(resolved)
+                self._paths_in(value, found)
+        elif isinstance(node, list):
+            for item in node:
+                self._paths_in(item, found)
 
-    async def run_async(self, id, image, container, project, workdir, out_base):
-        """Returns ``(final_diff, budget_exhausted)``, matching the other harnesses."""
-        host_repo, container_repo = self.extract_repo(image, container, project, workdir)
-
-        repo = self.init(host_repo)
-        repo.git.add(A=True)
-        mask_id = self.commit(repo)
-
-        # This harness only ever runs on the host, so the agent-visible
-        # metadata is read from beside the script rather than from the mount.
-        metadata = json.loads((Path(__file__).parent / "metadata.json").read_text())
-        sanitizer_report = metadata[id]["sanitizer_report"]
-
-        prompt = PROMPT.format(project=project, repo_folder=host_repo,
-                               sanitizer_report=sanitizer_report)
-        if NO_BROWSER_FLAG:
-            prompt += NO_BROWSER_PROMPT
-        # The agent edits on the host, so verification has to go through the
-        # container. Everything else about the prompt matches the other agents.
-        prompt = prompt.replace("`vulpatch compile`",
-                                f"`docker exec {container} vulpatch compile`")
-        prompt = prompt.replace("`vulpatch run`",
-                                f"`docker exec {container} vulpatch run`")
-        prompt = prompt.replace(
-            "The Proof-of-Concept (PoC) input that reproduces this vulnerability is at /tmp/poc.",
-            f"The Proof-of-Concept (PoC) input is at /tmp/poc inside the container "
-            f"{container}; the report's \"/src/{project}/...\" paths correspond to "
-            f"\"{host_repo}/...\" on disk.")
-
-        thresholds = list(range(COST_STEP, BUDGET_LIMIT + 1, COST_STEP))
-        next_idx = 0
-        budget_exhausted = False
-        spend = 0.0
-        counted = {}
-
-        def take_snapshot(threshold):
-            path = f"{out_base}_{threshold}.diff"
-            Path(path).write_text(self.diff_worktree(repo, mask_id), errors="ignore")
-            print(f"Snapshot at {threshold} dollars saved to {path}", flush=True)
-
-        def note_spend(value):
-            nonlocal next_idx, spend, budget_exhausted
-            spend = value
-            print(f"Estimated Claude spend: ${spend:.4f} / ${BUDGET_LIMIT:.2f}", flush=True)
-            while next_idx < len(thresholds) and spend >= thresholds[next_idx]:
-                take_snapshot(thresholds[next_idx])
-                next_idx += 1
-            if spend >= BUDGET_LIMIT:
-                budget_exhausted = True
-
-        options = ClaudeAgentOptions(
-            model=self.model_name,
-            permission_mode="default",
-            cwd=host_repo,
-            env=self.api_env,
-            allowed_tools=["Read", "Write", "Edit", "Bash"],
-            disallowed_tools={"Bash(rm*)", "Bash(docker rmi*)",
-                              "Bash(docker image rm*)", "WebSearch", "WebFetch"},
-            max_budget_usd=BUDGET_LIMIT,
-        )
-
-        session_id = None
-        chat_history = self.log_dir / "claudecode-chat-log.jsonl"
+    def _inside_repo(self, value) -> str | None:
+        """Absolute path for ``value`` if it names a non-markdown repo file."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        candidate = os.path.expanduser(value.strip())
+        resolved = os.path.abspath(
+            candidate if os.path.isabs(candidate)
+            else os.path.join(self.repo_folder, candidate))
         try:
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(prompt)
-                async for message in client.receive_response():
-                    print(message, flush=True)
-                    if isinstance(message, ResultMessage):
-                        session_id = message.session_id
-                        if message.total_cost_usd is not None:
-                            note_spend(message.total_cost_usd)
-                        print(message.result, flush=True)
-                        continue
-                    usage = getattr(message, "usage", None)
-                    mid = getattr(message, "message_id", None)
-                    cost = getattr(message, "total_cost_usd", None)
-                    if mid and cost is not None and counted.get(mid) != cost:
-                        counted[mid] = cost
-                        note_spend(sum(counted.values()))
-
-            if session_id:
-                source = self.session_log(host_repo, session_id)
-                if source.exists():
-                    shutil.copy(source, chat_history)
-                else:
-                    print(f"Claude chat history not found: {source}", flush=True)
-        finally:
-            # `vulpatch compile` runs as root inside the container and writes
-            # build artifacts into the bind mount, so the checkout has to be
-            # handed back before the container -- and with it root -- is gone.
-            run_cmd(["docker", "exec", container, "chown", "-R",
-                     f"{os.getuid()}:{os.getgid()}", container_repo], check=False)
-            run_cmd(["docker", "rm", "-f", container], check=False)
-
-        changed = self.changed_from_chat_history(chat_history, host_repo)
-        if not changed:
-            print("No files from chat history; falling back to git status.", flush=True)
-            changed = self.changed_from_git_status(repo)
-        if not changed:
-            print("No files were changed by Claude Code.", flush=True)
-
-        for path in changed:
-            try:
-                repo.git.add(path)
-            except Exception as e:  # noqa: BLE001 - one bad path must not lose the rest
-                print(f"Error adding {path}: {e}", flush=True)
-
-        self.commit(repo)
-        return self.diff_between(repo, mask_id, "HEAD"), budget_exhausted
-
-    def run(self, *args, **kwargs):
-        return asyncio.run(self.run_async(*args, **kwargs))
-
-
-def discard_workdir(workdir):
-    """Remove the extracted checkout. A no-op unless it is a real directory.
-
-    Refuses to follow a symlink, so a mis-set ``--workdir`` cannot delete
-    something outside the scratch tree.
-    """
-    path = Path(workdir)
-    if not path.is_dir() or path.is_symlink():
-        return
-    try:
-        shutil.rmtree(path)
-    except OSError as e:
-        # Never fatal: the diff is already written, and a tree left behind is
-        # a disk-space problem rather than a correctness one.
-        print(f"Could not remove working copy {path}: {e}", flush=True)
-        return
-    print(f"Removed working copy {path}", flush=True)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model-name', type=str)
-    parser.add_argument('--sanitizer_report', type=str)  # the task id
-    # Where to write the diff. The host owns the naming scheme.
-    parser.add_argument('--out-base', type=str)
-    parser.add_argument('--image', type=str)
-    parser.add_argument('--container', type=str)
-    parser.add_argument('--project', type=str)
-    parser.add_argument('--workdir', type=str)
-    parser.add_argument('--log-dir', type=str, default='/tmp/.claudecode')
-    args = parser.parse_args()
-
-    client = ClaudeCodeRunner(args.model_name, args.log_dir)
-    final_diff, budget_exhausted = client.run(
-        args.sanitizer_report, args.image, args.container,
-        args.project, args.workdir, args.out_base)
-
-    # Always save a final diff, whether or not the budget was exhausted.
-    if final_diff is not None:
-        out = Path(f'{args.out_base}.diff')
-        out.write_text(final_diff, errors="ignore")
-        # The extracted checkout is only discarded once the patch derived from
-        # it is verifiably on disk.
-        if final_diff and not out.stat().st_size:
-            raise RuntimeError(f"{out} is empty but the run produced a diff")
-        discard_workdir(args.workdir)
+            if os.path.commonpath([self.repo_folder, resolved]) != self.repo_folder:
+                return None
+        except ValueError:
+            return None
+        return None if resolved.lower().endswith(".md") else resolved
 
 
 if __name__ == "__main__":
-    main()
+    main(ClaudeCodeHarness)

@@ -1,133 +1,56 @@
-import os
-import time
-import sys
+"""Runs Codex through ``codex exec``."""
+
 import json
-import threading
-import argparse
-from git import Repo
+import os
 import shutil
 import subprocess
+import threading
+
 from pathlib import Path
-from constants import *
 
+from agent_base import AGENT_HOME, AgentHarness, AgentUnavailable, main
+from constants import MODEL_PRICING
 
-# Total dollar budget allowed for a single run. The process is killed once the
-# cost crosses this value.
-BUDGET_LIMIT = 30
-# A diff snapshot is taken every time the cost crosses a multiple of this value.
-COST_STEP = 5
-# How often (in seconds) the cost monitor polls the session token usage. A
-# smaller interval reduces how far the cost can overshoot a snapshot threshold
-# between two polls.
+#: How often the rollout logs are re-read for a spend estimate.
 POLL_INTERVAL_SECONDS = 15
+#: How long codex gets to shut down cleanly when stopped at the budget.
+STOP_GRACE_SECONDS = 10
 
 
-class CodexSnapshotRunner:
-    def __init__(self, model_name):
-        self.log_dir = f"/.codex/"
-        os.makedirs(self.log_dir, exist_ok=True)
+class CodexHarness(AgentHarness):
+    name = "codex"
 
-        # Codex only works with OpenAI models
-        self.model_name = model_name
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pricing = MODEL_PRICING[self.model_name]
+        self.codex_home = Path(AGENT_HOME) / ".codex"
+        self._changed: set[str] = set()
+        self._changed_lock = threading.Lock()
 
-    @staticmethod
-    def init(repo_dir):
-        shutil.rmtree(f"{repo_dir}/.git")
-        repo = Repo.init(repo_dir)
-        return repo
-
-    @staticmethod
-    def commit(repo: Repo, file=None):
-        msg = f"Auto-commit on {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        repo.git.commit("--allow-empty", "--no-verify", "-m", msg)
-        return repo.head.commit.hexsha
-
-    @staticmethod
-    def diff_between(repo: Repo, base_sha: str, head_sha: str):
-        cmd = [
-            "git", "diff", base_sha, head_sha,
-        ]
-
-        patch_text = repo.git.execute(
-            cmd,
-            stdout_as_string=True,
-            strip_newline_in_stdout=False,   # <-- key bit
-        )
-
-        return patch_text
-
-    @staticmethod
-    def _parse_file_changes(line):
-        """Return the list of changed paths reported by a single JSON event line.
-
-        Mirrors the parsing in ``get_file_changed`` but operates on a single
-        line so it can be consumed while codex is still running.
-        """
-        line = line.strip()
-        if not line:
-            return []
-        try:
-            evt = json.loads(line)
-        except json.JSONDecodeError:
-            # if anything non-JSON leaks into stdout, ignore it
-            return []
-
-        if evt.get("type") == "item.completed":
-            item = evt.get("item", {})
-            if item.get("type") == "file_change":
-                return [ch.get("path", "") for ch in item.get("changes", [])]
-        return []
-
-    @staticmethod
-    def get_file_changed(stdout):
-        changes = []
-        for line in stdout.splitlines():
-            changes.extend(CodexSnapshotRunner._parse_file_changes(line))
-        changes = list(set(changes))
-        return changes
-
-    def run(self, id, repo_folder, out_base):
-        """Run codex and take a diff snapshot every ``COST_STEP`` dollars.
-
-        Returns ``(final_diff, budget_exhausted)``. ``final_diff`` is always the
-        complete ``mask_id..HEAD`` diff and is meant to be written as the plain
-        ``.diff`` regardless of how the run ended (it is only ``None`` on an
-        early error such as a failed login). ``budget_exhausted`` is True when
-        the run was killed for crossing ``BUDGET_LIMIT`` (in which case the
-        per-threshold snapshots, including ``_{BUDGET_LIMIT}.diff``, were also
-        written).
-        """
-
-        repo_base = self.init(repo_folder)
-        repo_base.git.add(A=True)
-        mask_id = self.commit(repo_base)
-
-        metadata = json.loads(Path("/harnesses/metadata.json").read_text())
-        sanitizer_report = metadata[id]["sanitizer_report"]
-        project = metadata[id]["project"]
-
-        if NO_BROWSER_FLAG:
-            prompt = PROMPT.format(
-                project=project,
-                repo_folder=repo_folder,
-                sanitizer_report=sanitizer_report
-            ) + NO_BROWSER_PROMPT
+    def _install_config(self) -> None:
+        """Copy ``codex_config/config.toml`` into the agent's codex home."""
+        source = Path(__file__).parent / "codex_config" / "config.toml"
+        home = Path(self.on_disk(self.codex_home))
+        home.mkdir(parents=True, exist_ok=True)
+        if source.exists():
+            shutil.copy(source, home / "config.toml")
         else:
-            prompt = PROMPT.format(
-                project=project,
-                repo_folder=repo_folder,
-                sanitizer_report=sanitizer_report
-            )
+            print(f"note: no codex config at {source}", flush=True)
 
-        login_cmd = "printenv OPENAI_API_KEY | codex login --with-api-key"
-        result = subprocess.run(login_cmd, shell=True, check=False)
-        if result.returncode:
-            print("Login unsuccessful!", flush=True)
-            return None, False
+    # -- running the agent --------------------------------------------------
+
+    def invoke(self, prompt: str) -> None:
+        """Log in, then run ``codex exec`` while polling its spend."""
+        self._install_config()
+        key = os.environ.get("OPENAI_API_KEY", "")
+        env = self.agent_env(CODEX_HOME=str(self.codex_home), OPENAI_API_KEY=key)
+        login = subprocess.run(["codex", "login", "--with-api-key"], input=key, text=True,
+                               env=env, check=False, **self.as_agent())
+        if login.returncode:
+            raise AgentUnavailable("login unsuccessful")
 
         print(prompt)
-
-        run_cmd = [
+        command = [
             "codex",
             "--ask-for-approval", "never",
             "exec",
@@ -135,211 +58,118 @@ class CodexSnapshotRunner:
             "--model", self.model_name,
             "--config", 'model_reasoning_effort="medium"',
             "--config", 'web_search="disabled"',
-            "--cd", repo_folder,
+            "--cd", self.repo_folder,
             "--sandbox", "danger-full-access",
             prompt,
         ]
 
-        def _read_token_usage(path):
-            with open(path, "r", encoding="utf-8") as handle:
-                lines = handle.readlines()
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True,
+                                errors="ignore", env=env, **self.as_agent())
+        stop = threading.Event()
+        reader = threading.Thread(target=self._read_events, args=(proc,), daemon=True)
+        monitor = threading.Thread(target=self._watch_spend, args=(proc, stop),
+                                   daemon=True)
+        reader.start()
+        monitor.start()
+        try:
+            proc.wait()
+        finally:
+            stop.set()
+            monitor.join()
+            reader.join(timeout=30)
+            self._save_rollouts()
 
+    def _read_events(self, proc) -> None:
+        """Collect edited paths while codex is still running, for snapshots."""
+        for line in proc.stdout:
+            paths = self._paths_in_event(line)
+            if paths:
+                with self._changed_lock:
+                    self._changed.update(paths)
+
+    def _watch_spend(self, proc, stop: threading.Event) -> None:
+        """Price the latest token usage and kill codex at the budget."""
+        while not stop.is_set() and proc.poll() is None:
+            usage = self._latest_token_usage()
+            if usage is None:
+                print("Conversation not started yet; usage $0", flush=True)
+            else:
+                p = self.pricing
+                uncached = usage["input_tokens"] - usage["cached_input_tokens"]
+                spend = (uncached * p["input"]
+                         + usage["cached_input_tokens"] * p["cached_input"]
+                         + usage["output_tokens"] * p["output"]) / 1e6
+                if self.note_spend(spend):
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=STOP_GRACE_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    return
+            if stop.wait(POLL_INTERVAL_SECONDS):
+                return
+
+    # -- rollout logs -------------------------------------------------------
+
+    @property
+    def _sessions_dir(self) -> str:
+        return str(self.codex_home / "sessions")
+
+    def _rollout_paths(self) -> list[str]:
+        if not os.path.isdir(self._sessions_dir):
+            return []
+        found = subprocess.run(["find", self._sessions_dir, "-type", "f",
+                                "-name", "rollout*.jsonl", "-print0"],
+                               check=False, capture_output=True)
+        return [p.decode("utf-8") for p in found.stdout.split(b"\0") if p]
+
+    def _latest_token_usage(self):
+        """The most recent ``token_count`` record from any rollout log."""
+        for path in self._rollout_paths():
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.readlines()
             for raw in reversed(lines):
                 raw = raw.strip()
                 if not raw:
                     continue
                 record = json.loads(raw)
-                if "type" in record["payload"] and record["payload"]["type"] == "token_count":
-                    info = record["payload"]["info"]
-                    return info["total_token_usage"]
-            return None
+                payload = record.get("payload", {})
+                if payload.get("type") == "token_count":
+                    return payload["info"]["total_token_usage"]
+        return None
 
-        def _collect_latest_token_usage():
-            home = os.path.expanduser("~")
-            sessions_dir = os.path.join(home, ".codex", "sessions")
-            if not os.path.isdir(sessions_dir):
-                return None
+    def _save_rollouts(self) -> None:
+        """Copy the rollout logs into the log directory."""
+        for path in self._rollout_paths():
+            subprocess.run(["cp", path, str(self.log_dir)], check=False)
 
-            result = subprocess.run(
-                ["find", sessions_dir, "-type", "f",
-                    "-name", "rollout*.jsonl", "-print0"],
-                check=False,
-                capture_output=True,
-            )
-            paths = [p.decode("utf-8")
-                     for p in result.stdout.split(b"\0") if p]
+    # -- changed files ------------------------------------------------------
 
-            latest_usage = None
-            for src in paths:
-                usage = _read_token_usage(src)
-                if usage is not None:
-                    latest_usage = usage
-                    break
-            return latest_usage
-
-        # Shared state between the reader, monitor and main threads.
-        changed_files = set()
-        files_lock = threading.Lock()
-        stdout_lines = []
-
-        monitor_stop_event = threading.Event()
-        budget_exhausted = threading.Event()
-
-        # Snapshot thresholds: 5, 10, ..., BUDGET_LIMIT.
-        thresholds = list(range(COST_STEP, BUDGET_LIMIT + 1, COST_STEP))
-
-        def _stage_changed_files():
-            with files_lock:
-                files = list(changed_files)
-            for f in files:
-                if f.startswith(repo_folder):
-                    try:
-                        repo_base.git.add(f)
-                    except Exception as e:
-                        print(
-                            f"Error occurred while adding file {f}: {e}", flush=True)
-
-        def _take_snapshot(threshold):
-            """Commit the currently-known changes and write a snapshot diff."""
-            _stage_changed_files()
-            self.commit(repo_base)
-            diff = self.diff_between(repo_base, mask_id, "HEAD")
-            snapshot_path = f"{out_base}_{threshold}.diff"
-            Path(snapshot_path).write_text(diff, errors="ignore")
-            print(f"Snapshot at {threshold} dollars saved to {snapshot_path}",
-                  flush=True)
-
-        def _read_stdout(proc):
-            # Stream codex's JSON output so file changes can be tracked while it
-            # is still running (needed for mid-run snapshots).
-            for line in proc.stdout:
-                stdout_lines.append(line)
-                paths = self._parse_file_changes(line)
-                if paths:
-                    with files_lock:
-                        changed_files.update(paths)
-
-        def _monitor_usage(proc):
-            next_idx = 0  # index into `thresholds` of the next snapshot to take
-            while not monitor_stop_event.is_set():
-                if proc.poll() is not None:
-                    break
-                usage = _collect_latest_token_usage()
-
-                if usage is not None:
-                    pricing = MODEL_PRICING[self.model_name]
-                    uncached = usage["input_tokens"] - usage["cached_input_tokens"]
-                    cost = (uncached * pricing["input"]
-                            + usage["cached_input_tokens"] * pricing["cached_input"]
-                            + usage["output_tokens"] * pricing["output"]) / 1e6
-
-                    print(f"Current usage: {cost:.2f} dollars", flush=True)
-
-                    # Take a snapshot for every threshold the cost has crossed.
-                    # A single poll may cross several thresholds at once.
-                    while next_idx < len(thresholds) and cost >= thresholds[next_idx]:
-                        threshold = thresholds[next_idx]
-                        _take_snapshot(threshold)
-                        next_idx += 1
-
-                        if threshold >= BUDGET_LIMIT:
-                            budget_exhausted.set()
-                            if proc.poll() is None:
-                                proc.kill()
-                            break
-
-                    if budget_exhausted.is_set():
-                        break
-                else:
-                    print("Conversation not start yet!", flush=True)
-                    print(f"Current usage: 0 dollars", flush=True)
-
-                if monitor_stop_event.wait(POLL_INTERVAL_SECONDS):
-                    break
-
-        # Run with concurrent stdout streaming and token monitoring.
-        proc = subprocess.Popen(run_cmd,
-                                stderr=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE,
-                                text=True,
-                                errors="ignore",
-                                shell=False)
-
-        reader_thread = threading.Thread(
-            target=_read_stdout, args=(proc,), daemon=True)
-        reader_thread.start()
-        monitor_thread = threading.Thread(
-            target=_monitor_usage, args=(proc,), daemon=True)
-        monitor_thread.start()
-
+    @staticmethod
+    def _paths_in_event(line: str) -> list[str]:
+        """Paths named by one JSON event line, if it reports a file change."""
+        line = line.strip()
+        if not line:
+            return []
         try:
-            proc.wait()
-        finally:
-            monitor_stop_event.set()
-            monitor_thread.join()
-            reader_thread.join(timeout=30)
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            # Anything non-JSON that leaks into stdout is not an event.
+            return []
+        if event.get("type") != "item.completed":
+            return []
+        item = event.get("item", {})
+        if item.get("type") != "file_change":
+            return []
+        return [change.get("path", "") for change in item.get("changes", [])]
 
-        if budget_exhausted.is_set():
-            print(
-                f"Codex run terminated after exceeding {BUDGET_LIMIT} dollars usage.", flush=True)
-
-        stdout = "".join(stdout_lines).strip()
-
-        print("Conversation history:")
-        print(stdout)
-
-        # Persist the session rollout logs (same as the non-snapshot harness).
-        home = os.path.expanduser("~")
-        sessions_dir = os.path.join(home, ".codex", "sessions")
-        dst_dir = os.path.join("/.codex")
-        result = subprocess.run(
-            ["find", sessions_dir, "-type", "f",
-                "-name", "rollout*.jsonl", "-print0"],
-            check=False,
-            capture_output=True,
-        )
-        paths = [p.decode("utf-8") for p in result.stdout.split(b"\0") if p]
-        for src in paths:
-            subprocess.run(["cp", src, dst_dir], check=False)
-
-        # Build the final diff from the complete output and let the caller write
-        # the plain .diff. This happens whether the run finished naturally or was
-        # killed for exceeding the budget; in the latter case the per-threshold
-        # snapshots have already been written too.
-        changed_files_final = self.get_file_changed(stdout)
-        for f in changed_files_final:
-            if f.startswith(repo_folder):
-                try:
-                    repo_base.git.add(f)
-                except Exception as e:
-                    print(
-                        f"Error occurred while adding file {f}: {e}", flush=True)
-
-        self.commit(repo_base)
-        diff = self.diff_between(repo_base, mask_id, "HEAD")
-        return diff, budget_exhausted.is_set()
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model-name', type=str)
-    parser.add_argument('--sanitizer_report', type=str)
-    parser.add_argument('--repo-folder', type=str)
-    # parser.add_argument('--changed-file', type=str)
-    # Where to write the diff. The host owns the naming scheme.
-    parser.add_argument('--out-base', type=str)
-    args = parser.parse_args()
-
-    out_base = args.out_base
-
-    client = CodexSnapshotRunner(args.model_name)
-    final_diff, budget_exhausted = client.run(
-        args.sanitizer_report, args.repo_folder, out_base)
-
-    # Always save a final diff, whether or not the budget was exhausted.
-    if final_diff is not None:
-        Path(f'{out_base}.diff').write_text(final_diff, errors="ignore")
+    def changed_files(self) -> list[str]:
+        """Paths named by the ``file_change`` events codex printed."""
+        with self._changed_lock:
+            return sorted(p for p in self._changed if p)
 
 
 if __name__ == "__main__":
-    main()
+    main(CodexHarness)
