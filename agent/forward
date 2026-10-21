@@ -1,0 +1,81 @@
+#!/opt/agent/bin/python -I
+"""Runs one shell command in the task container on behalf of the agent.
+
+Started as root through sudo by ``shell``. It is the only program in the agent
+container that uses the Docker socket, and all it can do is start bash in this
+run's task container. It stays alive while the command runs, so stopping it --
+a timeout, an interrupt, the agent exiting -- stops the command there too.
+
+Usage: forward CWD [--env=NAME=VALUE ...] -- SHELL-ARGS...
+"""
+
+import ctypes
+import os
+import re
+import signal
+import subprocess
+import sys
+import uuid
+
+DOCKER = "/usr/local/bin/docker"
+#: Written by the harness: this run's task container.
+TASK_CONTAINER_FILE = "/opt/patchbench/task-container"
+ENV_ARG = re.compile(r"--env=([A-Za-z_][A-Za-z0-9_]*)=")
+
+# The Docker CLI's own settings stay out of the agent's home.
+os.environ["HOME"] = "/opt/patchbench/home"
+os.environ["DOCKER_CONFIG"] = "/opt/patchbench/home/.docker"
+
+cwd, rest = sys.argv[1], sys.argv[2:]
+split = rest.index("--")
+env_args = [arg for arg in rest[:split] if ENV_ARG.match(arg)]
+env_names = " ".join(ENV_ARG.match(arg).group(1) for arg in env_args)
+args = rest[split + 1:]
+
+task = open(TASK_CONTAINER_FILE).read().strip()
+pidfile = f"/run/pb-{uuid.uuid4().hex}"
+tty = ["-t"] if os.isatty(0) and os.isatty(1) else []
+
+# In the task container: record the command's process ID (it leads its own
+# session), drop settings whose value is a path that exists only in the agent
+# container, put the folders the agent added to its PATH that exist here too in
+# front of this container's PATH, then become the agent's shell, which keeps
+# that process ID.
+LAUNCHER = (f'echo $$ > {pidfile}; '
+            'for n in $PB_ENV_NAMES; do v=${!n}; '
+            'case "$v" in /*:*) ;; /*) [ -e "$v" ] || unset "$n" ;; esac; done; '
+            'pre=; IFS=:; for d in $PB_AGENT_PATH; do case ":$PATH:" in *":$d:"*) ;; '
+            '*) [ -d "$d" ] && pre="$pre$d:" ;; esac; done; unset IFS; PATH="$pre$PATH"; '
+            'cd "$PB_CWD" 2>/dev/null || cd /; unset PB_CWD PB_ENV_NAMES PB_AGENT_PATH; '
+            'exec /bin/bash "$@"')
+# Stops the whole session, including anything it starts while being stopped;
+# an interactive bash ignores TERM, hence the KILL loop.
+STOP = (f'p=$(cat {pidfile} 2>/dev/null) || exit 0; rm -f {pidfile}; '
+        'pkill -TERM -s "$p"; sleep 1; '
+        'for i in 1 2 3 4 5 6 7 8 9 10; do pkill -KILL -s "$p" || break; sleep 0.2; done')
+
+proc = None
+
+
+def stop(signum, _frame):
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)  # one cleanup, even if the stop arrives twice
+    subprocess.run([DOCKER, "exec", task, "/bin/bash", "-c", STOP],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if proc is not None:
+        proc.kill()
+    os._exit(128 + signum)
+
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, stop)
+# If sudo above us is killed outright, the kernel sends us SIGTERM.
+ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+proc = subprocess.Popen([DOCKER, "exec", "-i", *tty, *env_args,
+                         "-e", f"PB_ENV_NAMES={env_names}", "-e", f"PB_CWD={cwd}", task,
+                         "/bin/bash", "-c", LAUNCHER, "bash", *args])
+rc = proc.wait()
+subprocess.run([DOCKER, "exec", task, "rm", "-f", pidfile],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.exit(rc)

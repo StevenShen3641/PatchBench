@@ -98,6 +98,17 @@ Optional flags:
 
 `analyze` takes no flags, because the reports record which tasks and configurations ran.
 
+## Adding an Agent
+
+An agent needs two files, and usually no changes to `patchbench` itself:
+
+1. `agent/install/<name>.sh` installs the agent into the image. It runs as root at build time, with `uv` on `PATH` and the image's virtualenv (`/opt/agent`) active.
+2. `harnesses/<name>_harness.py` subclasses `AgentHarness` from `harnesses/agent_base.py`, implements `invoke(prompt)` and `changed_files()`, and ends with `main(<YourHarness>)`. The harness runs as root; start the agent program as the agent's user, with `env=self.agent_env(...)` and `**self.as_agent()`. If the agent has file tools of its own (rather than only a shell), refuse calls where `AgentHarness.file_allowed()` is false, so they stay within the folders shared with the task container.
+
+If the agent's commands rely on a file of its own image, as Codex's `apply_patch` helper relies on the Codex binary, also list that file under the agent in `Inference.AGENT_FILES_IN_TASK` (`patchbench/core/inference.py`). It is mounted read-only into the task container.
+
+Then pass `--agents <name>`; `patchbench infer` builds the agent's image from `agent/Dockerfile` on first use. The prompt, the git baseline, the budget snapshots and the diff all come from `AgentHarness`, which is what keeps a new agent's results comparable to the existing ones.
+
 ## One Quick Example
 
 One task end to end, e.g., using Claude Code and claude-opus-4-8 on task 11351 (harfbuzz).

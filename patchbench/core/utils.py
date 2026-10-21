@@ -313,6 +313,9 @@ class ScriptRunner:
     #: failing one stays recognisable after truncation.
     MAX_STREAM_BYTES = 50 * 1024 * 1024
     TRUNCATION_NOTICE = b"\n[output truncated]\n"
+    #: How long a script that is cut off gets to run its own cleanup (an exit
+    #: trap) before it is killed outright.
+    STOP_GRACE_SECONDS = 60
 
     def __init__(self, timeout: int = 3000, retries: int = 1,
                  retry_delay: int = 60) -> None:
@@ -348,11 +351,16 @@ class ScriptRunner:
                 capped[which] = totals[which] >= self.MAX_STREAM_BYTES
             elapsed = time.time() - start
 
-        proc.kill()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=self.STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
 
         for which in chunks:
             if capped[which]:
@@ -365,8 +373,11 @@ class ScriptRunner:
             all(capped.values()),
         )
 
-    def run(self, cmd: Sequence[str], container_name: str, label: str = "") -> ProcOutput:
-        """Execute one script, retrying only on upstream rate limiting."""
+    def run(self, cmd: Sequence[str], containers: str | Sequence[str], label: str = "") -> ProcOutput:
+        """Execute one script, retrying only on upstream rate limiting.
+
+        ``containers`` names what the script starts, removed afterwards.
+        """
         stdout = stderr = b""
         returncode = -1
 
@@ -400,8 +411,9 @@ class ScriptRunner:
 
         # The container is started with --rm, but a run killed mid-flight can
         # leave it behind and block the next run on the same name.
+        names = [containers] if isinstance(containers, str) else list(containers)
         subprocess.run(
-            ["docker", "rm", "-f", container_name],
+            ["docker", "rm", "-f", *names],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -586,6 +598,10 @@ class Stage(ABC):
         """The container this stage runs the task in."""
         return task.container_name(self.stage)
 
+    def containers_of(self, task: Task) -> list[str]:
+        """Every container a run of this stage starts, removed after the run."""
+        return [self.container_name(task)]
+
     def run_dir(self, task: Task, result_key: str) -> Path:
         """Where one result's stdout, stderr and cached output are written."""
         return self.paths.log_dir(self.stage, task.id, f"{task.slug}_{result_key}")
@@ -614,7 +630,7 @@ class Stage(ABC):
         name = self.container_name(job.task)
         print(f"[{self.stage}] running {name}", flush=True)
         runner = ScriptRunner(timeout=self.timeout, retries=self.retries)
-        proc = runner.run(job.command, name, name)
+        proc = runner.run(job.command, self.containers_of(job.task), name)
         for result_key, part in self.split(job, proc).items():
             part.save(self.run_dir(job.task, result_key))
         print(f"[{self.stage}] finished {name}", flush=True)

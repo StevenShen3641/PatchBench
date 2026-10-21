@@ -1,40 +1,67 @@
-"""Inference: run a coding agent against a task and collect the patch it produces."""
+"""Inference: run a coding agent against a task and collect the patch it produces.
+
+Every agent runs the same way, in two containers:
+
+* the **task container**, from the task image, where every command the agent
+  runs is executed -- the OSS-Fuzz toolchain, the PoC and ``vulpatch`` included;
+* the **agent container**, from ``agent/Dockerfile`` with only this task's
+  agent installed, where the agent program and its harness run. Each shell in
+  that image forwards its command to the task container. The few files of the
+  agent's own that those commands rely on (``AGENT_FILES_IN_TASK``) are mounted
+  into the task container read-only.
+
+``/src``, ``/out``, ``/tmp`` and ``/root`` are copied out of the task image and
+mounted at the same paths in both, so a file tool and a shell command see the
+same files. The prompt is the same for every agent, and only the patch the
+harness leaves in ``/diff`` is carried forward.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
-from ..config.constants import AGENT_INSTALL_COMMANDS
+from ..config.constants import AGENT_API_KEYS, MODEL_API_KEYS, MODELS
 from ..paths import PATHS, Paths
-from .utils import DockerScript, Job, ProcOutput, Stage, Task
+from .utils import Job, ProcOutput, Stage, Task
 
 
 class Inference(Stage):
-    """Runs each agent inside the task's own container and collects its diff.
-
-    The agent works in the real build environment so it can compile and test,
-    and only the patch it leaves in ``/diff`` is carried forward.
-    """
+    """Runs an agent against one task and records the diff it produced."""
 
     stage = "infer"
     result_keys = ("patch",)
     timeout = 28800
     retries = 3
 
-    #: Python the agent's toolchain is installed against, independent of the
-    #: image's own interpreter.
-    AGENT_PYTHON = "3.12"
+    #: Image an agent lives in, one per agent, all built from
+    #: ``agent/Dockerfile`` with ``--build-arg AGENT=<name>``. Built on first use
+    #: (see :meth:`ensure_agent_image`); override to use images tagged some
+    #: other way.
+    AGENT_IMAGE_TEMPLATE = os.environ.get("PATCHBENCH_AGENT_IMAGE_TEMPLATE",
+                                          "patchbench/agent-{agent}:latest")
+    #: Image label holding a fingerprint of the files the image was built from.
+    SOURCE_LABEL = "org.patchbench.source"
 
-    #: API keys forwarded from the host environment at run time. Their values
-    #: are never written into the generated script.
-    FORWARDED_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
+    #: Copied out of the task image and mounted at the same path in both
+    #: containers; ``/root`` is also the agent's home.
+    SHARED_DIRS = ("/src", "/out", "/tmp", "/root")
 
-    #: Agents that cannot be installed inside the task image. Their harness runs
-    #: on the host instead and drives the container from outside; the diff it
-    #: leaves behind is identical either way.
-    HOST_SIDE_AGENTS = {"claudecode"}
+    #: Files of an agent's image that its commands need in the task container,
+    #: mounted there read-only straight from the image. Codex puts
+    #: ``apply_patch`` and ``applypatch`` on its commands' PATH as links to its
+    #: own binary; agent/forward carries that folder over, and this is what the
+    #: links point to. Claude Code's commands run ``rg``, ``grep`` and ``find``
+    #: from its own program, named by CLAUDE_CODE_EXECPATH, which agent/forward
+    #: passes on only where that path exists. The path follows the agent
+    #: image's Python (AGENT_PYTHON in agent/Dockerfile).
+    AGENT_FILES_IN_TASK = {
+        "codex": ("/usr/local/bin/codex",),
+        "claudecode": ("/opt/agent/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude",),
+    }
 
     def __init__(self, paths: Paths = PATHS, rerun: bool = False) -> None:
         super().__init__(paths)
@@ -50,99 +77,178 @@ class Inference(Stage):
         return self.paths.diff_dir(task.id) / task.diff_name
 
     def agent_log_dir(self, task: Task) -> Path:
-        """The agent's own session logs, mounted as ``/.{agent}``."""
+        """The agent's own session logs."""
         return self.run_dir(task, "patch") / "agent"
+
+    def work_dir(self, task: Task) -> Path:
+        """Host-side home for the folders copied out of the task image."""
+        return self.paths.work_dir(task.id, task.slug)
+
+    def harness_path(self, task: Task) -> Path:
+        return self.paths.harnesses / f"{task.agent}_harness.py"
+
+    def agent_image(self, task: Task) -> str:
+        return self.AGENT_IMAGE_TEMPLATE.format(agent=task.agent)
+
+    def task_container(self, task: Task) -> str:
+        return f"{self.container_name(task)}_task"
+
+    def agent_container(self, task: Task) -> str:
+        return f"{self.container_name(task)}_agent"
+
+    def containers_of(self, task: Task) -> list[str]:
+        return [self.task_container(task), self.agent_container(task)]
 
     # -- setup --------------------------------------------------------------
 
     def build_scripts(self, task: Task) -> None:
         """Write the script that runs this task's agent and collects its patch."""
+        # Any agent with a harness is runnable; its image is built from the
+        # same Dockerfile, so there is no list of supported agents to keep.
+        if not self.harness_path(task).is_file():
+            raise ValueError(f"no harness for agent {task.agent!r}: "
+                             f"expected {self.harness_path(task)}")
+
         self.paths.diff_dir(task.id).mkdir(parents=True, exist_ok=True)
         self.agent_log_dir(task).mkdir(parents=True, exist_ok=True)
+        self.script_path(task).parent.mkdir(parents=True, exist_ok=True)
+        self.script_path(task).write_text(self.render(task))
 
-        if task.agent in self.HOST_SIDE_AGENTS:
-            self.script_path(task).parent.mkdir(parents=True, exist_ok=True)
-            self.script_path(task).write_text(self.host_script(task))
-            return
+    def render(self, task: Task) -> str:
+        """The whole run: copy the shared folders, start both containers, collect."""
+        project = self.project_of(task)
+        work = self.work_dir(task)
+        return "".join([
+            "#!/bin/bash\n",
+            "# Generated by patchbench; see patchbench/core/inference.py.\n",
+            "set -uo pipefail\n",
+            # Resolved on the host so the container can hand its writes back.
+            "export HOST_UID=$(id -u) HOST_GID=$(id -g)\n",
+            f"TASK_IMAGE={task.image}\n",
+            f"AGENT_IMAGE={self.agent_image(task)}\n",
+            f"TASK_CONTAINER={self.task_container(task)}\n",
+            f"AGENT_CONTAINER={self.agent_container(task)}\n",
+            f"WORK={work}\n",
+            f"PROJECT={project}\n",
+            "\n",
+            self._extract_shared(),
+            self._start_task_container(task),
+            self._run_agent(task),
+            self._collect(),
+        ])
 
-        if task.agent not in AGENT_INSTALL_COMMANDS:
-            raise ValueError(f"unsupported agent: {task.agent}")
+    def _mounts(self) -> str:
+        """The shared folders, mounted at the same path in either container."""
+        return "".join(f'  -v "$WORK{d}:{d}" \\\n' for d in self.SHARED_DIRS)
 
-        env: dict[str, str | None] = {"MAKEFLAGS": "-j8"}
-        env.update({key: None for key in self.FORWARDED_KEYS})
-
-        script = DockerScript(
-            image=task.image,
-            name=self.container_name(task),
-            volumes=[
-                f"{self.paths.harnesses}:/harnesses",
-                # The harnesses import this by name from their working directory.
-                f"{self.paths.root / 'patchbench' / 'config' / 'constants.py'}:/workdir/constants.py",
-                f"{self.paths.diff_dir(task.id)}:/diff",
-                f"{self.agent_log_dir(task)}:/.{task.agent}",
-            ],
-            env=env,
-        )
-        script.write(
-            self.script_path(task),
-            DockerScript.limit_nproc()
-            + self.install_agent(task)
-            + DockerScript.locate_repo(self.project_of(task))
-            + self.run_harness(task),
-        )
-
-    def host_script(self, task: Task) -> str:
-        """Script for an agent that runs on the host rather than in the image.
-
-        The harness is handed the same ``--out-base`` as the container-side
-        agents, so every downstream stage is unaffected by where it ran.
-        """
-        root = self.paths.root
+    def _extract_shared(self) -> str:
+        """Copy the shared folders out of the task image and find the checkout."""
         return (
-            "#!/bin/bash\n"
-            f"cd {root}\n"
-            # constants.py is imported by name, matching the container-side mount.
-            f"PYTHONPATH={root / 'patchbench' / 'config'} \\\n"
-            f"  uv run --extra {task.agent} harnesses/{task.agent}_harness.py \\\n"
-            f"    --model-name {task.model_name} \\\n"
-            f'    --sanitizer_report "{task.id}" \\\n'
-            f"    --project {self.project_of(task)} \\\n"
-            f"    --image {task.image} \\\n"
-            f"    --container {self.container_name(task)} \\\n"
-            f"    --out-base {self.paths.diff_dir(task.id) / task.slug} \\\n"
-            f"    --workdir {self.paths.work_dir(task.id, task.slug)} \\\n"
-            f"    --log-dir {self.agent_log_dir(task)}\n"
+            # The shared folders hold files of root and the image's other owners
+            # during the run, so on any exit -- a failed run included -- they all
+            # go to the host user from inside that container before it is removed.
+            "cleanup() {\n"
+            '  docker exec "$TASK_CONTAINER" chown -R "$HOST_UID:$HOST_GID" '
+            f'{" ".join(self.SHARED_DIRS)} >/dev/null 2>&1 || true\n'
+            '  docker rm -f "$TASK_CONTAINER" "$AGENT_CONTAINER" >/dev/null 2>&1 || true\n'
+            "}\n"
+            "trap cleanup EXIT\n"
+            "cleanup\n"
+            # A previous run may have been interrupted before it could clean up,
+            # possibly leaving files the host user cannot delete; those are
+            # removed from inside a throwaway container. Guarded because this
+            # is the one destructive step in the script.
+            'case "$WORK" in\n'
+            '  */out/work/*)\n'
+            '    rm -rf "$WORK" 2>/dev/null || {\n'
+            '      docker run --rm -v "$WORK:/work" --entrypoint /bin/rm "$TASK_IMAGE" '
+            f'-rf {" ".join("/work" + d for d in self.SHARED_DIRS)} >/dev/null 2>&1\n'
+            '      rm -rf "$WORK"; } ;;\n'
+            '  *) echo "refusing to clear $WORK" >&2; exit 1 ;;\n'
+            "esac\n"
+            'mkdir -p "$WORK"\n'
+            'REPO=$(docker run --rm --entrypoint /bin/sh "$TASK_IMAGE" -c '
+            "\"find /src -maxdepth 3 -type d -iname '$PROJECT' | head -n 1\")\n"
+            'if [ -z "$REPO" ]; then echo "no checkout named $PROJECT under /src" >&2; exit 1; fi\n'
+            # Copied by root inside the image with owners and modes kept, so the
+            # task container sees what the image has; the agent sees them all
+            # as its own (agent/view). `docker cp` unpacks as the host user, so
+            # it stops at the first read-only folder it creates, such as Go's
+            # module cache.
+            'docker run --rm -v "$WORK:/work" --entrypoint /bin/sh "$TASK_IMAGE" -c '
+            f'"cp -a {" ".join(self.SHARED_DIRS)} /work/" '
+            "|| exit 1\n"
+            "\n"
         )
 
-    def install_agent(self, task: Task) -> str:
-        """Provision uv and the agent's own toolchain inside the container."""
+    def _start_task_container(self, task: Task) -> str:
+        """Run the task image with the shared folders mounted over its own."""
+        agent_files = "".join(
+            '  --mount type=image,source="$AGENT_IMAGE",'
+            f'target={path},image-subpath={path.lstrip("/")} \\\n'
+            for path in self.AGENT_FILES_IN_TASK.get(task.agent, ()))
         return (
-            # The constants mount already creates /workdir, so this must not
-            # be a `mkdir && cd` chain -- the failed mkdir would skip the cd.
-            "mkdir -p /workdir\n"
-            "cd /workdir\n"
-            "apt install -y curl\n"
-            "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-            "cp -r /harnesses/* /workdir\n"
-            ". /root/.local/bin/env\n"
-            f"uv python install {self.AGENT_PYTHON}\n"
-            f"uv venv --python {self.AGENT_PYTHON}\n"
-            + AGENT_INSTALL_COMMANDS[task.agent].replace("\\$", "$").replace('\\"', '"')
+            'docker run -dit --name "$TASK_CONTAINER" \\\n'
+            '  --security-opt seccomp=unconfined \\\n'
+            + self._mounts()
+            + agent_files
+            + '  "$TASK_IMAGE" bash >/dev/null || exit 1\n'
+            "\n"
         )
 
-    def run_harness(self, task: Task) -> str:
-        """Invoke the agent's harness, then hand the outputs back to the host user."""
+    def _run_agent(self, task: Task) -> str:
+        """Run the agent image against the same folders, in the foreground."""
+        key = AGENT_API_KEYS.get(task.agent) or MODEL_API_KEYS.get(MODELS[task.model_name])
+        if key is None:
+            raise ValueError(f"no API key is known for {task.agent} with model {task.model_name}")
         return (
-            "cd /workdir\n"
-            f"uv run {task.agent}_harness.py"
-            f" --model-name {task.model_name}"
-            # The host owns the naming scheme, so the harness is told where to
-            # write rather than rebuilding the path from its own arguments.
-            f" --out-base /diff/{task.slug}"
-            ' --repo-folder $GIT_DIR'
-            f' --sanitizer_report "{task.id}"\n'
-            + DockerScript.chown_to_host(f"/.{task.agent}", "/diff")
+            'docker run --rm --name "$AGENT_CONTAINER" \\\n'
+            '  --security-opt seccomp=unconfined \\\n'
+            # Docker's AppArmor profile forbids the mounts agent/view makes,
+            # even to a privileged process; the privilege itself is given to
+            # that one step only (agent_base.AgentHarness.prepare). Its bindfs
+            # views need the FUSE device.
+            '  --security-opt apparmor=unconfined \\\n'
+            '  --device /dev/fuse \\\n'
+            # Only root here uses the socket: agent/forward, to start each of
+            # the agent's commands in the task container, and the harness, to
+            # set up the shared folders.
+            '  -v /var/run/docker.sock:/var/run/docker.sock \\\n'
+            + self._mounts()
+            + f'  -v {self.paths.harnesses}:/harnesses:ro \\\n'
+            # The harnesses import `constants` by name. It cannot be mounted
+            # into /harnesses itself -- a file mount needs a mountpoint inside a
+            # read-only mount -- so its directory goes on PYTHONPATH instead.
+            f"  -v {self.paths.root / 'patchbench' / 'config'}:/patchbench-config:ro \\\n"
+            '  -e PYTHONPATH=/patchbench-config \\\n'
+            f'  -v {self.paths.diff_dir(task.id)}:/diff \\\n'
+            f'  -v {self.agent_log_dir(task)}:/logs/{task.agent} \\\n'
+            '  -e PATCHBENCH_TASK_CONTAINER="$TASK_CONTAINER" \\\n'
+            '  -e PATCHBENCH_AGENT_CONTAINER="$AGENT_CONTAINER" \\\n'
+            '  -e HOST_UID -e HOST_GID \\\n'
+            # Only the key the agent reads, taken from the host environment at
+            # run time; its value is never written into the script.
+            f'  -e {key} \\\n'
+            # The image's entrypoint is its Python; the harness gives its
+            # outputs to HOST_UID itself.
+            + '  "$AGENT_IMAGE" \\\n'
+            f'  /harnesses/{task.agent}_harness.py \\\n'
+            # The harness gets the full model name (`gpt-5` -> `gpt-5-2025-08-07`);
+            # output names keep the name as given on the command line.
+            f'    --model-name {MODELS[task.model_name]} \\\n'
+            f'    --task-id {task.id} \\\n'
+            '    --repo-folder "$REPO" \\\n'
+            f'    --out-base /diff/{task.slug} \\\n'
+            f'    --log-dir /logs/{task.agent}\n'
+            # Carried to the end, so the collect step's cleanup cannot mask a
+            # failed agent behind a zero exit status.
+            "AGENT_RC=$?\n"
+            "\n"
         )
+
+    def _collect(self) -> str:
+        """End with the agent's status; the exit trap hands the folders back."""
+        return 'exit "$AGENT_RC"\n'
 
     # -- execution ----------------------------------------------------------
 
@@ -156,6 +262,34 @@ class Inference(Stage):
             return []
         return [Job(task, "patch", ["/bin/bash", str(script)])]
 
+    def agent_source(self, agent: str) -> str:
+        """Fingerprint of the files an agent's image is built from."""
+        root = self.paths.root / "agent"
+        digest = hashlib.sha256()
+        for path in ("Dockerfile", "shell", "forward", "view", f"install/{agent}.sh"):
+            digest.update(path.encode() + b"\0" + (root / path).read_bytes())
+        return digest.hexdigest()[:16]
+
+    def ensure_agent_image(self, agent: str) -> None:
+        """Build the agent's image unless an up-to-date one already exists.
+
+        The harnesses are mounted at run time rather than baked in, so only a
+        change to ``agent/`` itself calls for a rebuild.
+        """
+        image = self.AGENT_IMAGE_TEMPLATE.format(agent=agent)
+        source = self.agent_source(agent)
+        found = subprocess.run(
+            ["docker", "image", "inspect", "--format",
+             f'{{{{ index .Config.Labels "{self.SOURCE_LABEL}" }}}}', image],
+            capture_output=True, text=True)
+        if found.returncode == 0 and found.stdout.strip() == source:
+            return
+        print(f"[infer] building {image} from agent/ "
+              f"({'out of date' if found.returncode == 0 else 'not built yet'})")
+        subprocess.run(["docker", "build", "--build-arg", f"AGENT={agent}",
+                        "--label", f"{self.SOURCE_LABEL}={source}",
+                        "-t", image, str(self.paths.root / "agent")], check=True)
+
     def run(self, tasks, rerun: bool, num_workers: int) -> Path:
         """Run inference, then report which tasks ended up with a patch.
 
@@ -164,6 +298,8 @@ class Inference(Stage):
         """
         self.rerun = rerun
         jobs = [job for task in tasks for job in self.jobs_for(task)]
+        for agent in sorted({job.task.agent for job in jobs}):
+            self.ensure_agent_image(agent)
         print(f"[infer] running {len(jobs)} of {len(tasks)} tasks")
         self.run_jobs(jobs, num_workers)
 

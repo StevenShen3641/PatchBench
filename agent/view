@@ -1,0 +1,41 @@
+#!/opt/agent/bin/python -I
+"""Shows the shared folders to the agent's user as root sees them.
+
+Run once per run, as root with CAP_SYS_ADMIN (``docker exec --privileged``),
+before the agent starts:
+
+    view USER FOLDER...
+
+Each FOLDER is covered by a bindfs view of itself in which every file shows as
+USER's, so the agent's own file tools may change any of them; bindfs, running as
+root, makes each change, as root's commands in the task container would. Files
+keep their owners on disk and new ones are root's, so the task container keeps
+seeing what root's commands would leave there. Each FOLDER is also mounted as
+it is at DISK/FOLDER, which only root can reach, for the harness's bulk work
+(git), which the view would slow down.
+"""
+
+import os
+import subprocess
+import sys
+
+DISK = "/opt/patchbench/disk"
+
+
+def main() -> None:
+    user, folders = sys.argv[1], sys.argv[2:]
+    os.makedirs(DISK, mode=0o700, exist_ok=True)
+    os.chmod(DISK, 0o700)
+    for folder in folders:
+        plain = DISK + folder
+        os.makedirs(plain, exist_ok=True)
+        subprocess.run(["/usr/bin/mount", "--bind", folder, plain], check=True)
+        # `nonempty`: the view covers the folder's own files on purpose; root
+        # still reaches them at DISK/FOLDER.
+        subprocess.run(["/usr/bin/bindfs", f"--force-user={user}", f"--force-group={user}",
+                        "--create-as-mounter", "-o", "allow_other,nonempty", plain, folder],
+                       check=True)
+
+
+if __name__ == "__main__":
+    main()
