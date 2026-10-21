@@ -53,13 +53,14 @@ class Inference(Stage):
     #: Files of an agent's image that its commands need in the task container,
     #: mounted there read-only straight from the image. Codex puts
     #: ``apply_patch`` and ``applypatch`` on its commands' PATH as links to its
-    #: own binary; agent/forward carries that folder over, and this is what the
-    #: links point to. Claude Code's commands run ``rg``, ``grep`` and ``find``
+    #: own binary, and its package's ``codex-path`` (with ``rg``) in front of
+    #: that PATH; agent/forward carries both folders over, and these are what
+    #: they hold. Claude Code's commands run ``rg``, ``grep`` and ``find``
     #: from its own program, named by CLAUDE_CODE_EXECPATH, which agent/forward
     #: passes on only where that path exists. The path follows the agent
     #: image's Python (AGENT_PYTHON in agent/Dockerfile).
     AGENT_FILES_IN_TASK = {
-        "codex": ("/usr/local/bin/codex",),
+        "codex": ("/opt/codex/bin/codex", "/opt/codex/codex-path"),
         "claudecode": ("/opt/agent/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude",),
     }
 
