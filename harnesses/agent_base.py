@@ -19,7 +19,7 @@ from constants import (C_CPP_EXTENSIONS, NO_BROWSER_FLAG, NO_BROWSER_PROMPT,
                        PROMPT)
 
 #: Dollar budget for one run. The agent is stopped once spend crosses this.
-BUDGET_LIMIT = 5
+BUDGET_LIMIT = 30
 #: A diff snapshot is written each time spend crosses a multiple of this.
 COST_STEP = 5
 
